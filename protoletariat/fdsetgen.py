@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import abc
+import concurrent.futures
 import fnmatch
+import functools
 import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, MutableMapping, Sequence
 
-from google.protobuf.descriptor_pb2 import FileDescriptorSet
+from google.protobuf.descriptor_pb2 import FileDescriptorProto, FileDescriptorSet
 
 from .rewrite import ASTImportRewriter, build_rewrites
 
@@ -23,6 +25,48 @@ def _remove_proto_suffix(name: str) -> str:
 def _should_ignore(fd_name: str, patterns: Sequence[str]) -> bool:
     """Return whether `fd_name` should be ignored according to `patterns`."""
     return any(fnmatch.fnmatchcase(fd_name, pattern) for pattern in patterns)
+
+
+def _rewrite_file(
+    fd: FileDescriptorProto,
+    *,
+    rewriters: MutableMapping[str, ASTImportRewriter],
+    python_out: Path,
+    overwrite_callback: Callable[[Path, str], None],
+    module_suffixes: Sequence[str],
+    exclude_imports_glob: Sequence[str],
+) -> None:
+    name = fd.name
+    if _should_ignore(name, exclude_imports_glob):
+        return
+
+    fd_name = _remove_proto_suffix(name)
+    rewriters[fd_name] = rewriter = ASTImportRewriter()
+    # services live outside of the corresponding generated Python
+    # module, but they import it so we register a rewrite for the
+    # current proto as a dependency of itself to handle the case
+    # of services
+    for repl in build_rewrites(fd_name, fd_name):
+        rewriter.register_rewrite(repl)
+
+    # register proto import rewrites
+    for dep in map(_remove_proto_suffix, fd.dependency):
+        if _should_ignore(dep, exclude_imports_glob):
+            continue
+
+        dep_name = _remove_proto_suffix(dep)
+        for repl in build_rewrites(fd_name, dep_name):
+            rewriter.register_rewrite(repl)
+
+    for suffix in module_suffixes:
+        python_file = python_out.joinpath(f"{fd_name}{suffix}")
+        try:
+            raw_code = python_file.read_text()
+        except FileNotFoundError:
+            pass
+        else:
+            new_code = rewriters[fd_name].rewrite(raw_code)
+            overwrite_callback(python_file, new_code)
 
 
 class FileDescriptorSetGenerator(abc.ABC):
@@ -41,40 +85,21 @@ class FileDescriptorSetGenerator(abc.ABC):
         exclude_imports_glob: Sequence[str],
     ) -> None:
         """Fix imports from protoc/buf generated code."""
+        rewriters: dict[str, ASTImportRewriter] = {}
         fdset = FileDescriptorSet.FromString(self.generate_file_descriptor_set_bytes())
 
-        for fd in fdset.file:
-            name = fd.name
-            if _should_ignore(name, exclude_imports_glob):
-                continue
+        func = functools.partial(
+            _rewrite_file,
+            rewriters=rewriters,
+            python_out=python_out,
+            overwrite_callback=overwrite_callback,
+            module_suffixes=module_suffixes,
+            exclude_imports_glob=exclude_imports_glob,
+        )
 
-            fd_name = _remove_proto_suffix(name)
-            rewriter = ASTImportRewriter()
-            # services live outside of the corresponding generated Python
-            # module, but they import it so we register a rewrite for the
-            # current proto as a dependency of itself to handle the case
-            # of services
-            for repl in build_rewrites(fd_name, fd_name):
-                rewriter.register_rewrite(repl)
-
-            # register proto import rewrites
-            for dep in map(_remove_proto_suffix, fd.dependency):
-                if _should_ignore(dep, exclude_imports_glob):
-                    continue
-
-                dep_name = _remove_proto_suffix(dep)
-                for repl in build_rewrites(fd_name, dep_name):
-                    rewriter.register_rewrite(repl)
-
-            for suffix in module_suffixes:
-                python_file = python_out.joinpath(f"{fd_name}{suffix}")
-                try:
-                    raw_code = python_file.read_text()
-                except FileNotFoundError:
-                    pass
-                else:
-                    new_code = rewriter.rewrite(raw_code)
-                    overwrite_callback(python_file, new_code)
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            for fd in fdset.file:
+                pool.submit(func, fd)
 
         if create_package:
             python_out.joinpath("__init__.py").touch(exist_ok=True)

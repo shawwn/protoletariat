@@ -680,7 +680,7 @@ import "ignored.proto";
 
 message Foo {}
 """
-    ignored_code = ""
+    ignored_code = """syntax = "proto3";"""
     return [
         ProtoFile(basename="ignored_import.proto", code=ignored_import_code),
         ProtoFile(basename="ignored.proto", code=ignored_code),
