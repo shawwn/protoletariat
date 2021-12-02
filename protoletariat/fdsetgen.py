@@ -30,7 +30,6 @@ def _should_ignore(fd_name: str, patterns: Sequence[str]) -> bool:
 def _rewrite_file(
     fd: FileDescriptorProto,
     *,
-    rewriters: MutableMapping[str, ASTImportRewriter],
     python_out: Path,
     overwrite_callback: Callable[[Path, str], None],
     module_suffixes: Sequence[str],
@@ -41,7 +40,7 @@ def _rewrite_file(
         return
 
     fd_name = _remove_proto_suffix(name)
-    rewriters[fd_name] = rewriter = ASTImportRewriter()
+    rewriter = ASTImportRewriter()
     # services live outside of the corresponding generated Python
     # module, but they import it so we register a rewrite for the
     # current proto as a dependency of itself to handle the case
@@ -65,7 +64,7 @@ def _rewrite_file(
         except FileNotFoundError:
             pass
         else:
-            new_code = rewriters[fd_name].rewrite(raw_code)
+            new_code = rewriter.rewrite(raw_code)
             overwrite_callback(python_file, new_code)
 
 
@@ -85,12 +84,10 @@ class FileDescriptorSetGenerator(abc.ABC):
         exclude_imports_glob: Sequence[str],
     ) -> None:
         """Fix imports from protoc/buf generated code."""
-        rewriters: dict[str, ASTImportRewriter] = {}
         fdset = FileDescriptorSet.FromString(self.generate_file_descriptor_set_bytes())
 
         func = functools.partial(
             _rewrite_file,
-            rewriters=rewriters,
             python_out=python_out,
             overwrite_callback=overwrite_callback,
             module_suffixes=module_suffixes,
